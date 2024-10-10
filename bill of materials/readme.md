@@ -12,4 +12,7 @@
 |7|USB kabel| verbinding met PC voor programma|
 |8|Infrarood Lijnvolgsensor|voor het volgen van de zwarte lijn
 |9| weerstand
-|10|
+|10|wielen
+|11|chassis
+|12|led
+
