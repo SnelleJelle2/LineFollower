@@ -4,3 +4,6 @@ Een instructable is een stappenplan - zonder verdere uitleg - hoe je vertrekkend
 
 ### stap 1
 bestel alle componenten uit de bill of materials  
+
+### stap 2
+ded
