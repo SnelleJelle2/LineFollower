@@ -1,0 +1,35 @@
+const int buttonPin = 2;
+const int ledPin = 13;
+
+volatile bool toggleRequest = false;  // vlag die ISR zet
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50;
+
+bool ledState = false;
+
+void setup() {
+  pinMode(buttonPin, INPUT_PULLUP);  // interne pullup, knop naar GND
+  pinMode(ledPin, OUTPUT);
+  Serial.begin(9600);
+
+  attachInterrupt(digitalPinToInterrupt(buttonPin), buttonISR, FALLING);
+}
+
+void loop() {
+  if (toggleRequest) {
+    toggleRequest = false; // vlag terug leegmaken
+
+    unsigned long now = millis();
+    if (now - lastDebounceTime > debounceDelay) {
+      ledState = !ledState;
+      digitalWrite(ledPin, ledState);
+      Serial.print("LED = ");
+      Serial.println(ledState ? "AAN" : "UIT");
+      lastDebounceTime = now;
+    }
+  }
+}
+
+void buttonISR() {
+  toggleRequest = true;  // alleen de vlag zetten!
+}
