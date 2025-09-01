@@ -1,0 +1,361 @@
+// === Line follower: Kalibratie-op-commando + STOP/GO + PD + GainScheduling + Adaptieve snelheid + Pivot-Assist ===
+// + BT-commando's: kal, kal?, stop, go/start, base=NNN, base?, kp=..., kp?, kd=..., kd?, gs=..., gs?, gamma=..., gamma?
+// Board: Arduino UNO
+// Sensor: QTR-8A (hier 6 analoge kanalen op A0..A5)
+// Bluetooth: HC-05  TX -> D2 (Arduino RX),  RX -> D3 (Arduino TX via spanningsdeler), GND gemeenschappelijk
+
+#include <SoftwareSerial.h>
+#include <string.h>   // strcmp/strncmp
+#include <stdlib.h>   // atof/atoi
+
+SoftwareSerial BT(2, 3);           // RX(Arduino)=2, TX(Arduino)=3
+
+// ---------- Seriële snelheden ----------
+const long USB_BAUD = 9600;
+const long BT_BAUD  = 9600;        // HC-05 standaard
+
+// ---------- Sensorpins ----------
+#define SENSOR2 A0
+#define SENSOR3 A1
+#define SENSOR4 A2
+#define SENSOR5 A3
+#define SENSOR6 A4
+#define SENSOR7 A5
+
+const int sensorPins[6] = {SENSOR2, SENSOR3, SENSOR4, SENSOR5, SENSOR6, SENSOR7};
+int blackCalib[6], whiteCalib[6];
+
+// ---------- Weegfactoren (sterkere buitenste) ----------
+const int weights[6] = { -3000, -1800, -600, 600, 1800, 3000 };
+
+// ---------- Kalibratie ----------
+const unsigned long CALIB_TIME_MS = 5000; // 5 s kalibratie
+bool requestCalib = false;                // wordt true na "kal"
+bool hasCalib     = false;                // true na succesvolle kalibratie
+
+// ---------- Motors (PWM op de actieve richtingspin) ----------
+#define IN1 6    // LEFT  forward  (PWM)
+#define IN2 5    // LEFT  reverse  (PWM)
+#define IN3 9    // RIGHT forward  (PWM)
+#define IN4 10   // RIGHT reverse  (PWM)
+
+// ---------- PD + scheduling ----------
+float Kp_base = 0.55f;    // basis Kp
+float Kd      = 0.60f;    // demping
+long  lastError = 0;
+
+// Gain scheduling (meer bite bij grote fout)
+float gs    = 2.4f;       // schedulesterkte
+float gamma = 1.5f;       // kromming
+
+// ---------- Snelheden ----------
+int baseSpeed = 180;
+int maxSpeed  = 255;
+
+// Adaptieve snelheid (vertragen in bocht)
+int minSpeed  = 70;       // niet onder motordrempel
+int maxDrop   = 140;      // max daling t.o.v. baseSpeed
+
+// Pivot-Assist (voor U-bochten)
+float pivotThresh = 0.45f;
+int   pivotPWM    = 230;
+int   pivotMs     = 22;
+
+// ---------- STOP/GO ----------
+bool paused = false;
+
+// ---------- BT commandoparser (vaste buffer, geen String) ----------
+char    cmdBuf[32];
+uint8_t cmdLen = 0;
+
+static bool startsWith(const char* s, const char* pre) {
+  size_t n = strlen(pre);
+  return strncmp(s, pre, n) == 0;
+}
+
+void handleCommandC(const char* cmd) {
+  if (strcmp(cmd, "kal") == 0) {
+    requestCalib = true;
+    BT.println("OK: kalibratie 5s.");
+    Serial.println(F("OK: kalibratie 5s."));
+
+  } else if (strcmp(cmd, "stop") == 0 || strcmp(cmd, "pause") == 0 || strcmp(cmd, "pauze") == 0) {
+    paused = true;
+    stopMotors();
+    BT.println("OK: STOP geactiveerd. Stuur 'go' om te hervatten.");
+    Serial.println(F("OK: STOP geactiveerd. Stuur 'go' om te hervatten."));
+
+  } else if (strcmp(cmd, "go") == 0 || strcmp(cmd, "start") == 0 || strcmp(cmd, "run") == 0) {
+    paused = false;
+    BT.println("OK: hervatten.");
+    Serial.println(F("OK: hervatten."));
+
+  } else if (strcmp(cmd, "kal?") == 0) {
+    if (!hasCalib) {
+      BT.println("Nog niet gekalibreerd. Stuur eerst 'kal'.");
+      Serial.println(F("kal?: nog niet gekalibreerd."));
+    } else {
+      BT.println("KAL RANGES (black->white):");
+      for (int i=0;i<6;i++){
+        BT.print(i); BT.print(": ");
+        BT.print(blackCalib[i]); BT.print(" -> ");
+        BT.println(whiteCalib[i]);
+      }
+      Serial.println(F("kal? verstuurd."));
+    }
+
+  // ---- baseSpeed instellen/opvragen ----
+  } else if (startsWith(cmd, "base=") || startsWith(cmd, "basespeed=") || startsWith(cmd, "speed=")) {
+    const char* p = strchr(cmd, '=');
+    int v = p ? atoi(p + 1) : baseSpeed;
+    v = constrain(v, 0, 255);
+    baseSpeed = v;
+    BT.print("OK: baseSpeed="); BT.println(baseSpeed);
+    Serial.print(F("baseSpeed set to ")); Serial.println(baseSpeed);
+
+  } else if (strcmp(cmd, "base?") == 0) {
+    BT.print("baseSpeed="); BT.print(baseSpeed);
+    BT.print("  minSpeed="); BT.print(minSpeed);
+    BT.print("  maxDrop=");  BT.println(maxDrop);
+    Serial.println(F("base? verstuurd."));
+
+  // ---- NIEUW/REEDS: Kp, Kd, gs, gamma instellen/opvragen ----
+  } else if (startsWith(cmd, "kp=")) {
+    const char* p = strchr(cmd, '=');
+    if (p) {
+      float v = atof(p + 1);
+      if (v < 0.01f) v = 0.01f;
+      if (v > 2.00f) v = 2.00f;   // veiligheidslimiet
+      Kp_base = v;
+      BT.print("OK: Kp_base="); BT.println(Kp_base, 3);
+      Serial.print(F("Kp_base set to ")); Serial.println(Kp_base, 3);
+    }
+
+  } else if (strcmp(cmd, "kp?") == 0) {
+    BT.print("Kp_base="); BT.println(Kp_base, 3);
+
+  } else if (startsWith(cmd, "kd=")) {            // <---- NIEUW
+    const char* p = strchr(cmd, '=');
+    if (p) {
+      float v = atof(p + 1);
+      if (v < 0.00f) v = 0.00f;
+      if (v > 3.00f) v = 3.00f;   // veiligheidslimiet
+      Kd = v;
+      BT.print("OK: Kd="); BT.println(Kd, 3);
+      Serial.print(F("Kd set to ")); Serial.println(Kd, 3);
+    }
+
+  } else if (strcmp(cmd, "kd?") == 0) {           // <---- NIEUW
+    BT.print("Kd="); BT.println(Kd, 3);
+
+  } else if (startsWith(cmd, "gs=")) {
+    const char* p = strchr(cmd, '=');
+    if (p) {
+      float v = atof(p + 1);
+      if (v < 0.0f) v = 0.0f;
+      if (v > 5.0f) v = 5.0f;
+      gs = v;
+      BT.print("OK: gs="); BT.println(gs, 3);
+      Serial.print(F("gs set to ")); Serial.println(gs, 3);
+    }
+
+  } else if (strcmp(cmd, "gs?") == 0) {
+    BT.print("gs="); BT.println(gs, 3);
+
+  } else if (startsWith(cmd, "gamma=")) {
+    const char* p = strchr(cmd, '=');
+    if (p) {
+      float v = atof(p + 1);
+      if (v < 0.5f) v = 0.5f;
+      if (v > 3.0f) v = 3.0f;
+      gamma = v;
+      BT.print("OK: gamma="); BT.println(gamma, 3);
+      Serial.print(F("gamma set to ")); Serial.println(gamma, 3);
+    }
+
+  } else if (strcmp(cmd, "gamma?") == 0) {
+    BT.print("gamma="); BT.println(gamma, 3);
+
+  } else if (strcmp(cmd, "help") == 0) {
+    BT.println("cmds: kal | kal? | stop | go/start | base=NNN | base? | kp=x | kp? | kd=x | kd? | gs=x | gs? | gamma=x | gamma?");
+  } else if (cmd[0] != '\0') {
+    BT.print("Onbekend: "); BT.println(cmd);
+    Serial.print(F("Onbekend commando: ")); Serial.println(cmd);
+  }
+}
+
+void pollBluetooth() {
+  while (BT.available()) {
+    char c = BT.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      cmdBuf[cmdLen] = '\0';
+      handleCommandC(cmdBuf);
+      cmdLen = 0;
+    } else if (cmdLen < sizeof(cmdBuf) - 1) {
+      if (c >= 'A' && c <= 'Z') c = c + 32;   // lowercase
+      cmdBuf[cmdLen++] = c;
+    }
+  }
+}
+
+// ---------- Helpers ----------
+void readNormalized(int norm[6]) {
+  for (int i = 0; i < 6; i++) {
+    int raw = analogRead(sensorPins[i]);
+    int lo = blackCalib[i], hi = whiteCalib[i];
+    int v  = (hi==lo) ? ((raw>=hi)?100:0) : map(raw, lo, hi, 0, 100);
+    norm[i] = constrain(v, 0, 100);
+  }
+}
+
+long computePosition(const int norm[6]) {
+  long num=0, den=0;
+  for (int i=0;i<6;i++){
+    int darkness = 100 - norm[i];   // 0=wit, 100=zwart
+    num += (long)darkness * weights[i];
+    den += darkness;
+  }
+  if (den==0) return 99999;
+  return num/den; // ~ -3000..+3000
+}
+
+// Sturing met teken: positief = vooruit, negatief = achteruit
+void setMotorsSigned(int left, int right){
+  left  = constrain(left,  -maxSpeed, maxSpeed);
+  right = constrain(right, -maxSpeed, maxSpeed);
+
+  if (left >= 0) { analogWrite(IN1, left);  digitalWrite(IN2, LOW);  }
+  else           { digitalWrite(IN1, LOW);  analogWrite(IN2, -left); }
+
+  if (right >= 0){ analogWrite(IN3, right); digitalWrite(IN4, LOW);  }
+  else            { digitalWrite(IN3, LOW);  analogWrite(IN4, -right); }
+}
+
+// Alleen-vooruit variant (normaal rijden)
+void setMotorsForwardPWM(int leftPWM, int rightPWM){
+  leftPWM  = constrain(leftPWM,  0, maxSpeed);
+  rightPWM = constrain(rightPWM, 0, maxSpeed);
+  analogWrite(IN1, leftPWM);  digitalWrite(IN2, LOW);
+  analogWrite(IN3, rightPWM); digitalWrite(IN4, LOW);
+}
+
+void stopMotors(){
+  analogWrite(IN1, 0); analogWrite(IN2, 0);
+  analogWrite(IN3, 0); analogWrite(IN4, 0);
+}
+
+// ---------- Autokalibratie ----------
+void autoCalibrate(unsigned long ms){
+  for (int i=0;i<6;i++){ blackCalib[i]=1023; whiteCalib[i]=0; }
+  unsigned long t0=millis();
+  while (millis()-t0 < ms){
+    for(int i=0;i<6;i++){
+      int raw=analogRead(sensorPins[i]);
+      if(raw<blackCalib[i]) blackCalib[i]=raw;
+      if(raw>whiteCalib[i]) whiteCalib[i]=raw;
+    }
+    delay(5);
+  }
+  for (int i=0;i<6;i++){
+    if (whiteCalib[i]-blackCalib[i] < 20){
+      blackCalib[i] = max(0, blackCalib[i]-10);
+      whiteCalib[i] = min(1023, whiteCalib[i]+10);
+    }
+  }
+  hasCalib = true;
+}
+
+// ---------- Setup/Loop ----------
+void setup(){
+  Serial.begin(USB_BAUD);
+  BT.begin(BT_BAUD);
+
+  pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT);
+  pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);
+  stopMotors();
+
+  Serial.println(F("Ready. cmds: kal | kal? | stop | go | base=NNN | base? | kp=x | kp? | kd=x | kd? | gs=x | gs? | gamma=x | gamma?"));
+  BT.println("Ready. cmds: kal | kal? | stop | go | base=NNN | base? | kp=x | kp? | kd=x | kd? | gs=x | gs? | gamma=x | gamma?");
+}
+
+void loop(){
+  // 1) BT commando's verwerken
+  pollBluetooth();
+
+  // 1b) Blijvende STOP
+  if (paused) {
+    stopMotors();
+    delay(5);
+    return;
+  }
+
+  // 2) Kalibratie op commando
+  if (requestCalib) {
+    stopMotors();
+    Serial.println(F("Kalibreren... beweeg over wit & zwart (5s)."));
+    BT.println("Kalibreren... beweeg over wit & zwart (5s).");
+    autoCalibrate(CALIB_TIME_MS);
+    lastError = 0;
+    Serial.println(F("Kalibratie klaar."));
+    BT.println("Kalibratie klaar.");
+    requestCalib = false;
+  }
+
+  // 3) Normale line-following
+  int norm[6];
+  readNormalized(norm);
+
+  long pos = computePosition(norm);
+  if (pos == 99999){
+    stopMotors();
+    delay(3);
+    return;
+  }
+
+  float error = - (float)pos;
+  float aerr  = fabs(error);
+  const float maxW = (float)abs(weights[5]); // 3000
+  float normErr = aerr / maxW;               // 0..1
+  if (normErr>1.0f) normErr=1.0f;
+
+  // --- Gain scheduling: agressiever bij grote fout ---
+  float Kp_eff = Kp_base * (1.0f + gs * pow(normErr, gamma));
+
+  // PD
+  float deriv = error - (float)lastError;
+  float corr  = Kp_eff * error + Kd * deriv;
+  lastError   = (long)error;
+
+  // --- Adaptieve basis: mild remmen in bocht ---
+  int drop    = (int)(normErr * maxDrop);
+  int dynBase = baseSpeed - drop;
+  if (dynBase < minSpeed) dynBase = minSpeed;
+
+  // Differentieel sturen rond dynBase
+  int leftPWM  = (int)(dynBase + corr);
+  int rightPWM = (int)(dynBase - corr);
+
+  // --- Multiplicatieve rem: licht extra remmen bij grote fout ---
+  float brake = 1.0f - 0.35f * normErr;
+  if (brake < 0.55f) brake = 0.55f;
+  leftPWM  = (int)(leftPWM  * brake);
+  rightPWM = (int)(rightPWM * brake);
+
+  // --- Pivot-Assist ---
+  if (normErr >= pivotThresh){
+    int sign = (error > 0) ? +1 : -1;
+    int L =  sign * pivotPWM;
+    int R = -sign * pivotPWM;
+    setMotorsSigned(L, R);
+    delay(pivotMs);
+    return;
+  }
+
+  setMotorsForwardPWM(
+    constrain(leftPWM,  0, maxSpeed),
+    constrain(rightPWM, 0, maxSpeed)
+  );
+
+  delay(2);
+}
