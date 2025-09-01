@@ -30,6 +30,7 @@ sensor-test (raw waarden uitlezen in Serial Monitor)
 interrupt-test (start/stop knop)
 
 ### stap 7
+Upload nu volledige code
 Kalibreer de QTR-sensoren (kal via de Serial Monitor).
 
 Test de commando’s (go, stop, kp=, kd=, base=, help?)
